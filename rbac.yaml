@@ -1,0 +1,44 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitops-updater
+  namespace: default
+  labels:
+    app.kubernetes.io/name: gitops-updater
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitops-updater
+  labels:
+    app.kubernetes.io/name: gitops-updater
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - nodes
+    verbs: ["get", "list"]
+  - apiGroups: ["source.toolkit.fluxcd.io"]
+    resources:
+      - gitrepositories
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources:
+      - kustomizations
+    verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitops-updater
+  labels:
+    app.kubernetes.io/name: gitops-updater
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gitops-updater
+subjects:
+  - kind: ServiceAccount
+    name: gitops-updater
+    namespace: default
