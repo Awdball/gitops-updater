@@ -56,6 +56,36 @@ When you tap **Apply**, the bot commits rollout annotations directly to your Git
 - **Renovate / Flux Image Automation** require rewriting Git tags to pinned semver digests and fail on mutable tags like `:latest` or `:v4`.
 - **GitOps Updater** allows you to keep `:latest` or `:vX` in your manifests while safely rolling out new releases through Git.
 
+<details>
+<summary><b>🔍 Deep Dive: How Workloads & Versions Are Discovered</b></summary>
+
+<br>
+
+### 1. In-Cluster Workload Discovery
+When a scan runs (either scheduled or via `/check`), `gitops-updater`:
+- **Discovers Running Pods:** Queries the Kubernetes API (`/api/v1/pods`) across all namespaces to inspect running containers.
+- **Extracts Live Image Digests:** Retrieves the exact image digest running in the container runtime via `.status.containerStatuses[*].imageID` (`sha256:...`).
+- **Detects Node Architecture:** Inspects the node hosting each pod (`.spec.nodeName`) to identify target CPU architecture (`amd64` vs. `arm64`), ensuring multi-architecture images resolve the matching platform manifest.
+- **Correlates with Git Manifests:** Parses YAML files in your GitOps manifests directory (`APPS_DIR`) to match live pods back to their source Deployment, StatefulSet, or DaemonSet declarations.
+
+### 2. Upstream Version Resolution
+For each tracked container, `gitops-updater` queries the upstream OCI registry (`docker.io`, `ghcr.io`, `lscr.io`, etc.):
+- **Resolves Multi-Arch Manifests:** Pulls the manifest for the tag channel (e.g. `:latest` or `:v4`) and resolves the manifest list / OCI index to match the running node's architecture.
+- **Primary Resolution (OCI Labels):** Downloads the container config blob and reads standard OCI metadata labels:
+  - `org.opencontainers.image.version`
+  - `org.label-schema.version`
+  - `com.docker.image.version`
+  - `version`
+- **Fallback Resolution (Registry Tag Matching):** If the image author did not embed OCI labels in the image config, the bot automatically queries the registry's tags API, matches the running digest against existing tags, and extracts the corresponding semantic version tag (`vX.Y.Z`).
+
+### 3. Decision Matrix
+Comparing the live runtime state against upstream registry metadata:
+- **`current`:** Live digest matches upstream registry digest. Workload is up to date.
+- **`same version; rebuilt`:** Digest differs, but semantic version string is unchanged (e.g., base OS security rebuild).
+- **`update available`:** Newer semantic version detected (e.g., `4.0.9` ➔ `4.0.10`). Pushed to Telegram with `[ 🚀 Apply Updates ]`.
+
+</details>
+
 ---
 
 ## 3-Minute Quickstart
