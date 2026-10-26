@@ -24,10 +24,87 @@ logger = logging.getLogger("gitops_updater.engine")
 IMAGE_LINE = re.compile(r"^(?P<indent>\s+image:\s+)(?P<image>[^\s#]+)(?P<suffix>\s*(?:#.*)?)$")
 WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"}
 TAG_VERSION = re.compile(r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
+SEMVER_REGEX = re.compile(r"\bv?(?P<major>\d+)(?:\.(?P<minor>\d+))?(?:\.(?P<patch>\d+))?\b")
 MANIFEST_LIST_TYPES = {
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.oci.image.index.v1+json",
 }
+
+
+def parse_semver(version: str) -> tuple[int, int, int] | None:
+    if not version:
+        return None
+    m = SEMVER_REGEX.search(version.strip())
+    if not m:
+        return None
+    major = int(m.group("major"))
+    minor = int(m.group("minor")) if m.group("minor") is not None else 0
+    patch = int(m.group("patch")) if m.group("patch") is not None else 0
+    return major, minor, patch
+
+
+def is_major_change(curr_version: str, latest_version: str) -> bool:
+    curr_parsed = parse_semver(curr_version)
+    latest_parsed = parse_semver(latest_version)
+    if curr_parsed is None or latest_parsed is None:
+        return True
+    return curr_parsed[0] != latest_parsed[0]
+
+
+def is_plex_workload(workload: str, repository: str) -> bool:
+    wl = (workload or "").lower()
+    repo = (repository or "").lower()
+    return "plex" in wl or "mediaslave" in wl or "plex" in repo or "pms-docker" in repo
+
+
+def check_plex_active_streams(
+    plex_url: str = "http://192.168.0.10:32400",
+    token: str | None = None,
+    timeout: float = 5.0,
+) -> tuple[bool, str]:
+    clean_url = plex_url.rstrip("/")
+    if not clean_url.startswith("http://") and not clean_url.startswith("https://"):
+        clean_url = f"http://{clean_url}"
+    endpoint = f"{clean_url}/status/sessions"
+
+    headers = {"Accept": "application/json", "User-Agent": "gitops-updater/1.0"}
+    if token:
+        headers["X-Plex-Token"] = token
+
+    try:
+        req = Request(endpoint, headers=headers)
+        with urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            raw = resp.read().decode("utf-8", errors="replace")
+            if "json" in content_type or raw.strip().startswith("{"):
+                data = json.loads(raw)
+                container = data.get("MediaContainer", {})
+                size = container.get("size", 0)
+                metadata = container.get("Metadata", [])
+                if size == 0 and not metadata:
+                    return False, "No active streams"
+                stream_details = []
+                for item in metadata:
+                    user = item.get("User", {}).get("title") or "User"
+                    player = item.get("Player", {}).get("title") or item.get("Player", {}).get("product") or "Device"
+                    grandparent = item.get("grandparentTitle")
+                    title = item.get("title") or "Media"
+                    media_name = f"{grandparent} - {title}" if grandparent else title
+                    stream_details.append(f"{user} on {player} watching '{media_name}'")
+                detail_text = "; ".join(stream_details) if stream_details else f"{size} stream(s) active"
+                return True, detail_text
+
+            size_match = re.search(r'size="(\d+)"', raw)
+            if size_match:
+                size = int(size_match.group(1))
+                if size == 0:
+                    return False, "No active streams"
+                return True, f"{size} stream(s) active in Plex"
+
+            return False, "No active streams"
+    except Exception as exc:
+        logger.warning(f"Failed to query Plex streaming status from {endpoint}: {exc}")
+        return True, f"Failed to reach Plex server at {endpoint}: {exc}"
 
 
 @dataclass(frozen=True)
@@ -60,6 +137,8 @@ class Update:
     available: RegistryImage
     running_version: str
     latest_version: str
+    is_major: bool = False
+    is_plex: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +177,8 @@ class ApplyResult:
     success: bool
     commit_sha: str | None = None
     updated_workloads: list[str] = field(default_factory=list)
+    deferred_workloads: list[str] = field(default_factory=list)
+    deferred_reasons: dict[str, str] = field(default_factory=dict)
     error_message: str | None = None
 
 
@@ -399,6 +480,8 @@ class GitOpsEngine:
         flux_namespace: str = "flux-system",
         flux_git_repositories: list[str] | None = None,
         flux_kustomizations: list[str] | None = None,
+        plex_url: str = "http://192.168.0.10:32400",
+        plex_token: str | None = None,
     ):
         self.repo_dir = repo_dir
         self.apps_dir_name = apps_dir_name
@@ -408,6 +491,12 @@ class GitOpsEngine:
         self.flux_namespace = flux_namespace
         self.flux_git_repositories = flux_git_repositories
         self.flux_kustomizations = flux_kustomizations
+        self.plex_url = plex_url
+        self.plex_token = plex_token
+
+    def is_plex_streaming(self) -> tuple[bool, str]:
+        """Validates if any client is actively streaming on Plex."""
+        return check_plex_active_streams(self.plex_url, self.plex_token)
 
     def ensure_latest_git(self) -> None:
         """Pulls and resets to latest remote branch before scanning or applying."""
@@ -505,6 +594,9 @@ class GitOpsEngine:
                 if state != "update available":
                     continue
 
+                is_major = is_major_change(current_version, latest_version)
+                is_plex = is_plex_workload(item.workload, item.repository)
+
                 for ref in matching_refs:
                     if ref.current != latest.update_reference:
                         result.updates.append(Update(
@@ -512,6 +604,8 @@ class GitOpsEngine:
                             available=latest,
                             running_version=current_version,
                             latest_version=latest_version,
+                            is_major=is_major,
+                            is_plex=is_plex,
                         ))
 
             except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
@@ -544,13 +638,41 @@ class GitOpsEngine:
                 success=True,
                 commit_sha=None,
                 updated_workloads=[],
+                deferred_workloads=[],
+                deferred_reasons={},
                 error_message="No pending updates found to apply.",
+            )
+
+        # Validate Plex streaming status if any Plex update is in the batch
+        deferred_workloads: list[str] = []
+        deferred_reasons: dict[str, str] = {}
+        applicable_updates: list[Update] = []
+
+        for update in updates_to_apply:
+            if update.is_plex or is_plex_workload(update.image.workload, update.image.repository):
+                is_streaming, stream_reason = self.is_plex_streaming()
+                if is_streaming:
+                    logger.warning(f"Plex update deferred due to active streaming: {stream_reason}")
+                    deferred_workloads.append(f"{update.image.workload} ({update.running_version} -> {update.latest_version})")
+                    deferred_reasons[update.image.workload] = stream_reason
+                    continue
+            applicable_updates.append(update)
+
+        if not applicable_updates:
+            return ApplyResult(
+                applied_at=now,
+                success=True,
+                commit_sha=None,
+                updated_workloads=[],
+                deferred_workloads=deferred_workloads,
+                deferred_reasons=deferred_reasons,
+                error_message="All candidate updates deferred (Plex active streaming detected)." if deferred_workloads else "No updates to apply.",
             )
 
         changed_files: set[Path] = set()
         workloads_updated: list[str] = []
 
-        for update in updates_to_apply:
+        for update in applicable_updates:
             replace_image(update)
             changed_files.add(update.image.file)
             workloads_updated.append(f"{update.image.workload} ({update.running_version} -> {update.latest_version})")
@@ -572,7 +694,13 @@ class GitOpsEngine:
             err = f"Kustomize validation failed: {exc.stderr}"
             logger.error(err)
             subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=self.repo_dir)
-            return ApplyResult(applied_at=now, success=False, error_message=err)
+            return ApplyResult(
+                applied_at=now,
+                success=False,
+                deferred_workloads=deferred_workloads,
+                deferred_reasons=deferred_reasons,
+                error_message=err,
+            )
 
         # Git commit and push
         try:
@@ -598,8 +726,16 @@ class GitOpsEngine:
                 success=True,
                 commit_sha=sha,
                 updated_workloads=workloads_updated,
+                deferred_workloads=deferred_workloads,
+                deferred_reasons=deferred_reasons,
             )
         except subprocess.CalledProcessError as exc:
             err = f"Git commit/push or reconciliation failed: {exc}"
             logger.error(err)
-            return ApplyResult(applied_at=now, success=False, error_message=err)
+            return ApplyResult(
+                applied_at=now,
+                success=False,
+                deferred_workloads=deferred_workloads,
+                deferred_reasons=deferred_reasons,
+                error_message=err,
+            )

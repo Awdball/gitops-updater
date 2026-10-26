@@ -71,9 +71,14 @@ def main() -> int:
     flux_kustomizations_raw = os.environ.get("FLUX_KUSTOMIZATIONS", "").strip()
     flux_kustomizations = [x.strip() for x in flux_kustomizations_raw.split(",") if x.strip()] or None
 
+    plex_url = os.environ.get("PLEX_URL", "http://192.168.0.10:32400").strip()
+    plex_token = os.environ.get("PLEX_TOKEN", "").strip() or None
+
     logger.info(f"Initializing GitOpsEngine for repository: {repo_dir}")
     logger.info(f"Cluster: '{cluster_name}', Manifests directory: '{apps_dir_name}'")
     logger.info(f"Rollout annotation key: '{rollout_annotation_key}'")
+    logger.info(f"Plex streaming check URL: '{plex_url}'")
+    logger.info("Auto-apply policy: minor/patch updates applied automatically; major version changes require Telegram approval.")
     if skip_repositories:
         logger.info(f"Ignored image repositories: {skip_repositories}")
     logger.info(f"Scheduled scan time: {schedule_time} (delay between workloads: {schedule_delay}s)")
@@ -88,6 +93,8 @@ def main() -> int:
         flux_namespace=flux_namespace,
         flux_git_repositories=flux_git_repositories,
         flux_kustomizations=flux_kustomizations,
+        plex_url=plex_url,
+        plex_token=plex_token,
     )
     bot = TelegramBot(
         token=token,

@@ -4,16 +4,31 @@
 [![Container Image](https://img.shields.io/badge/GHCR-ghcr.io%2Fawdball%2Fgitops--updater-blue?logo=docker)](https://github.com/Awdball/gitops-updater/pkgs/container/gitops-updater)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**GitOps Updater** is a lightweight Kubernetes ChatOps bot. It monitors upstream container registries for image updates and sends push notifications to your phone via Telegram with one-tap approval buttons:
+**GitOps Updater** is a lightweight Kubernetes ChatOps bot. It monitors upstream container registries for image updates, automatically applies minor and patch releases, and sends Telegram alerts with one-tap approval buttons for major version upgrades:
 
 ```text
-🔔 Image Updates Available (Production)
+⚡ Auto-Applied Image Updates (Production)
 
+The following updates fall within the current version line and were applied automatically:
 • sonarr: 4.0.9 ➔ 4.0.10
 • tautulli: v2.18.2 ➔ v2.18.3
 
+Commit: abc1234
+🔄 Flux reconciliation triggered.
+```
+
+When a major version change is detected (e.g. `postgres: 15.4 ➔ 16.0`), the bot sends an approval prompt:
+
+```text
+🔔 Major Version Updates Available (Production)
+
+• postgres: 15.4 ➔ 16.0
+
 [ 🚀 Apply Updates ]   [ ❌ Dismiss ]
 ```
+
+### 🛡️ Plex Streaming Protection
+Before applying **any** update to Plex (whether automated or manual), GitOps Updater queries Plex's active sessions. If any client is actively streaming, the Plex update is safely postponed, leaving active viewers uninterrupted while allowing other workloads to roll out.
 
 When you tap **Apply**, the bot commits rollout annotations directly to your GitOps repository (Flux / Argo CD) and triggers an immediate reconciliation. 
 
@@ -192,6 +207,8 @@ Open your bot in Telegram and send:
 
 | Variable | Default | Description |
 |---|---|---|
+| `PLEX_URL` | `http://192.168.0.10:32400` | URL of the Plex Media Server for session and streaming validation. |
+| `PLEX_TOKEN` | *None* | Optional `X-Plex-Token` if authentication is required to access `/status/sessions`. |
 | `SCHEDULE_DELAY_SECONDS` | `120` | Delay (seconds) between workload checks during the daily scheduled crawl to prevent Docker Hub throttling. |
 | `MANUAL_DELAY_SECONDS` | `0.5` | Delay (seconds) between workload checks during on-demand `/check`. |
 | `SKIP_REPOSITORIES` | `""` | Comma-separated list of image names to ignore (e.g. local images like `my-app:cpu`). |

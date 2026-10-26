@@ -166,7 +166,8 @@ class TelegramBot:
             if scan.updates:
                 msg += "\n<b>Pending Updates:</b>\n"
                 for u in scan.updates:
-                    msg += f"• <code>{u.image.workload}</code>: <code>{u.running_version}</code> ➔ <code>{u.latest_version}</code>\n"
+                    badge = " <i>[Major]</i>" if u.is_major else ""
+                    msg += f"• <code>{u.image.workload}</code>: <code>{u.running_version}</code> ➔ <code>{u.latest_version}</code>{badge}\n"
                 markup = {
                     "inline_keyboard": [
                         [
@@ -194,40 +195,7 @@ class TelegramBot:
                 self.is_scanning = True
                 try:
                     scan = self.engine.check_updates(delay_seconds=self.manual_delay_seconds)
-                    self.latest_scan = scan
-                    if scan.updates:
-                        body = (
-                            f"🚀 <b>{len(scan.updates)} Image Update(s) Available:</b>\n\n"
-                        )
-                        for u in scan.updates:
-                            body += (
-                                f"• <b>{u.image.workload}</b>\n"
-                                f"   <code>{u.running_version}</code> ➔ <b><code>{u.latest_version}</code></b>\n\n"
-                            )
-                        if scan.errors:
-                            body += f"⚠️ <i>{len(scan.errors)} notices/errors encountered during scan.</i>\n"
-
-                        markup = {
-                            "inline_keyboard": [
-                                [
-                                    {"text": "🚀 Apply Updates", "callback_data": "apply_updates"},
-                                    {"text": "❌ Dismiss", "callback_data": "dismiss"},
-                                ]
-                            ]
-                        }
-                        if msg_id:
-                            self.edit_message(chat_id, msg_id, body, reply_markup=markup)
-                        else:
-                            self.send_message(chat_id, body, reply_markup=markup)
-                    else:
-                        body = (
-                            "✅ <b>All cluster workloads are up to date!</b>\n"
-                            f"Inspected {scan.up_to_date_count + scan.rebuilt_count} workloads. No new versions found."
-                        )
-                        if msg_id:
-                            self.edit_message(chat_id, msg_id, body)
-                        else:
-                            self.send_message(chat_id, body)
+                    self.process_scan(scan, chat_id=chat_id, message_id=msg_id, is_scheduled=False)
                 except Exception as exc:
                     logger.exception("Error during manual check")
                     err_msg = f"❌ <b>Error checking updates:</b>\n<code>{exc}</code>"
@@ -243,6 +211,129 @@ class TelegramBot:
         elif cmd == "/apply":
             self.execute_apply(chat_id=chat_id)
 
+    def process_scan(
+        self,
+        scan: ScanResult,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+        is_scheduled: bool = False,
+    ) -> None:
+        """Processes scan results: auto-applies minor/patch updates and prompts only for major updates."""
+        self.latest_scan = scan
+        finish_time = datetime.now().strftime("%H:%M %Z")
+
+        # Partition updates into minor/patch (auto-applicable) vs major version changes
+        auto_updates = [u for u in scan.updates if not u.is_major]
+        major_updates = [u for u in scan.updates if u.is_major]
+
+        auto_applied_result: ApplyResult | None = None
+        deferred_plex_note: str = ""
+
+        if auto_updates:
+            plex_auto = [u for u in auto_updates if u.is_plex]
+            non_plex_auto = [u for u in auto_updates if not u.is_plex]
+            updates_to_run = list(non_plex_auto)
+
+            if plex_auto:
+                is_streaming, stream_reason = self.engine.is_plex_streaming()
+                if is_streaming:
+                    logger.info(f"Auto-apply: Plex has active streaming ({stream_reason}), deferring Plex update.")
+                    deferred_plex_note = (
+                        f"⏸️ <b>Plex update deferred:</b>\n"
+                        f"Active stream in progress (<i>{stream_reason}</i>). "
+                        "Plex will update automatically on the next scan once playback finishes."
+                    )
+                else:
+                    updates_to_run.extend(plex_auto)
+
+            if updates_to_run:
+                auto_applied_result = self.engine.apply_updates(updates_to_run)
+                if auto_applied_result.success:
+                    applied_keys = {(u.image.file, u.image.line_number) for u in updates_to_run}
+                    scan.updates = [u for u in scan.updates if (u.image.file, u.image.line_number) not in applied_keys]
+                else:
+                    logger.error(f"Failed to auto-apply updates: {auto_applied_result.error_message}")
+
+        # 1. Send Auto-Applied Summary if updates were applied or Plex was deferred
+        if auto_applied_result and auto_applied_result.success and auto_applied_result.updated_workloads:
+            summary = (
+                f"⚡ <b>Auto-Applied Image Updates ({self.cluster_name})</b>\n\n"
+                f"The following updates fall within the current version line and were applied automatically:\n\n"
+            )
+            for w in auto_applied_result.updated_workloads:
+                summary += f"• <code>{w}</code>\n"
+            summary += f"\n<b>Commit:</b> <code>{auto_applied_result.commit_sha}</code>\n"
+            summary += "🔄 <b>Flux reconciliation triggered.</b> Pods will roll out automatically."
+            if deferred_plex_note:
+                summary += f"\n\n{deferred_plex_note}"
+
+            if chat_id:
+                if message_id and not major_updates:
+                    self.edit_message(chat_id, message_id, summary)
+                    message_id = None
+                else:
+                    self.send_message(chat_id, summary)
+            else:
+                self.broadcast(summary)
+
+        elif deferred_plex_note and not (auto_applied_result and auto_applied_result.updated_workloads):
+            msg = f"🔔 <b>Image Update Notification ({self.cluster_name})</b>\n\n{deferred_plex_note}"
+            if chat_id:
+                if message_id and not major_updates:
+                    self.edit_message(chat_id, message_id, msg)
+                    message_id = None
+                else:
+                    self.send_message(chat_id, msg)
+            else:
+                self.broadcast(msg)
+
+        # 2. Prompt for Major Version Updates if any
+        if major_updates:
+            prompt = (
+                f"🔔 <b>Major Version Updates Available ({self.cluster_name})</b>\n"
+                f"<i>Manual approval required for major version upgrades:</i>\n\n"
+            )
+            for u in major_updates:
+                prompt += (
+                    f"• <b>{u.image.workload}</b>\n"
+                    f"   <code>{u.running_version}</code> ➔ <b><code>{u.latest_version}</code></b>\n\n"
+                )
+            if scan.errors:
+                prompt += f"⚠️ <i>{len(scan.errors)} notices/errors encountered during scan.</i>\n"
+
+            markup = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🚀 Apply Updates", "callback_data": "apply_updates"},
+                        {"text": "❌ Dismiss", "callback_data": "dismiss"},
+                    ]
+                ]
+            }
+            if chat_id:
+                if message_id:
+                    self.edit_message(chat_id, message_id, prompt, reply_markup=markup)
+                else:
+                    self.send_message(chat_id, prompt, reply_markup=markup)
+            else:
+                self.broadcast(prompt, reply_markup=markup)
+
+        # 3. All Up to Date (no auto updates, no major updates, no deferred Plex)
+        elif not (auto_applied_result and auto_applied_result.updated_workloads) and not deferred_plex_note:
+            if chat_id:
+                body = (
+                    "✅ <b>All cluster workloads are up to date!</b>\n"
+                    f"Inspected {scan.up_to_date_count + scan.rebuilt_count} workloads. No new versions found."
+                )
+                if message_id:
+                    self.edit_message(chat_id, message_id, body)
+                else:
+                    self.send_message(chat_id, body)
+            elif is_scheduled and self.notify_on_no_updates:
+                self.broadcast(
+                    f"🔔 <b>Daily Image Check ({self.cluster_name}):</b> "
+                    f"All running workloads are current (checked at {finish_time})."
+                )
+
     def execute_apply(self, chat_id: int, message_id: int | None = None) -> None:
         if self.is_applying:
             msg = "⏳ An update apply is already running. Please wait..."
@@ -254,7 +345,7 @@ class TelegramBot:
 
         status_msg = (
             "⏳ <b>Applying updates...</b>\n"
-            "Modifying Git manifests, validating Kustomize, committing to <code>origin/main</code>, and notifying Flux..."
+            "Checking Plex stream status, modifying Git manifests, committing to <code>origin/main</code>, and notifying Flux..."
         )
         if message_id:
             self.edit_message(chat_id, message_id, status_msg)
@@ -267,18 +358,35 @@ class TelegramBot:
                 updates = self.latest_scan.updates if self.latest_scan else None
                 result: ApplyResult = self.engine.apply_updates(updates)
                 if result.success:
-                    if not result.updated_workloads:
+                    if not result.updated_workloads and not result.deferred_workloads:
                         text = "ℹ️ <b>No updates needed to be applied.</b>"
                     else:
-                        workloads_list = "\n".join(f"• <code>{w}</code>" for w in result.updated_workloads)
-                        text = (
-                            "🎉 <b>Updates successfully applied!</b>\n\n"
-                            f"<b>Commit:</b> <code>{result.commit_sha}</code>\n"
-                            f"<b>Updated Workloads:</b>\n{workloads_list}\n\n"
-                            "🔄 <b>Flux reconciliation triggered.</b> Pods will roll out automatically."
-                        )
+                        text = ""
+                        if result.updated_workloads:
+                            workloads_list = "\n".join(f"• <code>{w}</code>" for w in result.updated_workloads)
+                            text += (
+                                "🎉 <b>Updates successfully applied!</b>\n\n"
+                                f"<b>Commit:</b> <code>{result.commit_sha}</code>\n"
+                                f"<b>Updated Workloads:</b>\n{workloads_list}\n\n"
+                                "🔄 <b>Flux reconciliation triggered.</b> Pods will roll out automatically.\n"
+                            )
+                        if result.deferred_workloads:
+                            deferred_list = "\n".join(f"• <code>{w}</code>" for w in result.deferred_workloads)
+                            reasons = "\n".join(f"<i>{v}</i>" for v in result.deferred_reasons.values())
+                            text += (
+                                f"\n⏸️ <b>Plex update postponed:</b>\n{deferred_list}\n{reasons}\n"
+                                "Cannot update Plex while active streaming is in progress."
+                            )
+
                     if self.latest_scan:
-                        self.latest_scan.updates.clear()
+                        if result.deferred_workloads:
+                            # Keep only deferred workloads in latest_scan
+                            self.latest_scan.updates = [
+                                u for u in self.latest_scan.updates
+                                if u.is_plex or any(k in u.image.workload for k in result.deferred_reasons)
+                            ]
+                        else:
+                            self.latest_scan.updates.clear()
                 else:
                     text = f"❌ <b>Failed to apply updates:</b>\n<code>{result.error_message}</code>"
 
@@ -362,30 +470,7 @@ class TelegramBot:
                 self.is_scanning = True
                 try:
                     scan = self.engine.check_updates(delay_seconds=self.schedule_delay_seconds)
-                    self.latest_scan = scan
-                    finish_time = datetime.now().strftime("%H:%M %Z")
-                    if scan.updates:
-                        body = (
-                            f"🔔 <b>Daily Image Update Report ({self.cluster_name})</b>\n"
-                            f"<i>Paced scan completed at {finish_time}</i>\n\n"
-                            f"Found <b>{len(scan.updates)}</b> new update(s) available:\n\n"
-                        )
-                        for u in scan.updates:
-                            body += (
-                                f"• <b>{u.image.workload}</b>\n"
-                                f"   <code>{u.running_version}</code> ➔ <b><code>{u.latest_version}</code></b>\n\n"
-                            )
-                        markup = {
-                            "inline_keyboard": [
-                                [
-                                    {"text": "🚀 Apply Updates", "callback_data": "apply_updates"},
-                                    {"text": "❌ Dismiss", "callback_data": "dismiss"},
-                                ]
-                            ]
-                        }
-                        self.broadcast(body, reply_markup=markup)
-                    elif self.notify_on_no_updates:
-                        self.broadcast(f"🔔 <b>Daily Image Check ({self.cluster_name}):</b> All running workloads are current (checked at {finish_time}).")
+                    self.process_scan(scan, is_scheduled=True)
                 except Exception as exc:
                     logger.exception("Error in scheduled check")
                 finally:
