@@ -115,6 +115,17 @@ class ImageRef:
     current: str
     repository: str
     tag: str
+    container_name: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        if self.container_name and self.container_name != self.workload:
+            if "litestream" in self.container_name.lower():
+                return f"{self.workload} [litestream sidecar]"
+            return f"{self.workload} [{self.container_name}]"
+        if "litestream" in self.repository.lower():
+            return f"{self.workload} [litestream sidecar]"
+        return self.workload
 
 
 @dataclass(frozen=True)
@@ -367,14 +378,26 @@ def find_images(root: Path, apps_dir_name: str = "apps") -> list[ImageRef]:
             continue
         if not any(document and document.get("kind") in WORKLOAD_KINDS for document in documents):
             continue
-        for line_number, line in enumerate(path.read_text().splitlines(), 1):
+        lines = path.read_text().splitlines()
+        for line_number, line in enumerate(lines, 1):
             match = IMAGE_LINE.match(line)
             if not match:
                 continue
             parsed = parse_image(match.group("image"))
             if parsed:
                 repository, tag = parsed
-                images.append(ImageRef(path, line_number, path.parent.name, match.group("image"), repository, tag))
+                indent = len(match.group("indent")) - len(match.group("indent").lstrip())
+                container_name = None
+                for prev_idx in range(line_number - 2, -1, -1):
+                    prev_line = lines[prev_idx]
+                    prev_indent = len(prev_line) - len(prev_line.lstrip())
+                    name_match = re.search(r"^\s*(?:-\s*)?name:\s*[\"']?([^\s\"'#]+)", prev_line)
+                    if name_match and prev_indent <= indent:
+                        container_name = name_match.group(1)
+                        break
+                    if prev_line.strip() in ("containers:", "initContainers:"):
+                        break
+                images.append(ImageRef(path, line_number, path.parent.name, match.group("image"), repository, tag, container_name))
     return images
 
 
@@ -653,8 +676,10 @@ class GitOpsEngine:
                 is_streaming, stream_reason = self.is_plex_streaming()
                 if is_streaming:
                     logger.warning(f"Plex update deferred due to active streaming: {stream_reason}")
-                    deferred_workloads.append(f"{update.image.workload} ({update.running_version} -> {update.latest_version})")
-                    deferred_reasons[update.image.workload] = stream_reason
+                    deferred_entry = f"{update.image.display_name} ({update.running_version} -> {update.latest_version})"
+                    if deferred_entry not in deferred_workloads:
+                        deferred_workloads.append(deferred_entry)
+                    deferred_reasons[update.image.display_name] = stream_reason
                     continue
             applicable_updates.append(update)
 
@@ -675,7 +700,9 @@ class GitOpsEngine:
         for update in applicable_updates:
             replace_image(update)
             changed_files.add(update.image.file)
-            workloads_updated.append(f"{update.image.workload} ({update.running_version} -> {update.latest_version})")
+            entry = f"{update.image.display_name} ({update.running_version} -> {update.latest_version})"
+            if entry not in workloads_updated:
+                workloads_updated.append(entry)
 
         marker = now.isoformat(timespec="seconds")
         for path in changed_files:

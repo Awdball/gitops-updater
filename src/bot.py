@@ -167,7 +167,7 @@ class TelegramBot:
                 msg += "\n<b>Pending Updates:</b>\n"
                 for u in scan.updates:
                     badge = " <i>[Major]</i>" if u.is_major else ""
-                    msg += f"• <code>{u.image.workload}</code>: <code>{u.running_version}</code> ➔ <code>{u.latest_version}</code>{badge}\n"
+                    msg += f"• <code>{u.image.display_name}</code>: <code>{u.running_version}</code> ➔ <code>{u.latest_version}</code>{badge}\n"
                 markup = {
                     "inline_keyboard": [
                         [
@@ -295,7 +295,7 @@ class TelegramBot:
             )
             for u in major_updates:
                 prompt += (
-                    f"• <b>{u.image.workload}</b>\n"
+                    f"• <b>{u.image.display_name}</b>\n"
                     f"   <code>{u.running_version}</code> ➔ <b><code>{u.latest_version}</code></b>\n\n"
                 )
             if scan.errors:

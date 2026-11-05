@@ -59,6 +59,23 @@ class TestSemverAndClassification(unittest.TestCase):
         self.assertFalse(is_plex_workload("tautulli", "ghcr.io/linuxserver/tautulli"))
         self.assertFalse(is_plex_workload("postgres", "postgres:15"))
 
+    def test_image_ref_display_name(self):
+        # Primary container
+        main_ref = ImageRef(Path("/tmp/audiobookshelf.yaml"), 10, "audiobookshelf", "ghcr.io/advplyr/audiobookshelf:latest", "ghcr.io/advplyr/audiobookshelf", "latest", "audiobookshelf")
+        self.assertEqual(main_ref.display_name, "audiobookshelf")
+
+        # Litestream sidecar container
+        ls_sidecar = ImageRef(Path("/tmp/audiobookshelf.yaml"), 20, "audiobookshelf", "litestream/litestream:latest", "litestream/litestream", "latest", "litestream")
+        self.assertEqual(ls_sidecar.display_name, "audiobookshelf [litestream sidecar]")
+
+        # Litestream restore init container
+        ls_restore = ImageRef(Path("/tmp/audiobookshelf.yaml"), 5, "audiobookshelf", "litestream/litestream:latest", "litestream/litestream", "latest", "litestream-restore")
+        self.assertEqual(ls_restore.display_name, "audiobookshelf [litestream sidecar]")
+
+        # Other sidecar (e.g. redis in paperless)
+        redis_ref = ImageRef(Path("/tmp/paperless.yaml"), 15, "paperless", "redis:7-alpine", "redis", "7-alpine", "redis")
+        self.assertEqual(redis_ref.display_name, "paperless [redis]")
+
 
 class TestPlexStreamingValidation(unittest.TestCase):
     @patch("updater.urlopen")
