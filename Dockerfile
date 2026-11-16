@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir pyyaml
 ARG TARGETARCH
 RUN curl -LO "https://dl.k8s.io/release/v1.31.0/bin/linux/${TARGETARCH}/kubectl" \
     && chmod +x kubectl \
-    && mv kubectl /usr/local/bin/
+    && mv kubectl /usr/local/bin/ \
+    && kubectl version --client
 
 WORKDIR /app
 
