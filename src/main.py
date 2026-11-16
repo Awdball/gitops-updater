@@ -71,7 +71,7 @@ def main() -> int:
     flux_kustomizations_raw = os.environ.get("FLUX_KUSTOMIZATIONS", "").strip()
     flux_kustomizations = [x.strip() for x in flux_kustomizations_raw.split(",") if x.strip()] or None
 
-    plex_url = os.environ.get("PLEX_URL", "http://192.168.0.10:32400").strip()
+    plex_url = os.environ.get("PLEX_URL", "http://192.168.10.10:32400").strip()
     plex_token = os.environ.get("PLEX_TOKEN", "").strip() or None
 
     logger.info(f"Initializing GitOpsEngine for repository: {repo_dir}")
