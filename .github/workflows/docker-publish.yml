@@ -63,7 +63,7 @@ jobs:
           sbom: false
 
       - name: Prune untagged dev-build versions
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: false
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PKG: ${{ github.event.repository.name }}
