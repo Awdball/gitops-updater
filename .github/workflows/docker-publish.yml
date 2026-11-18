@@ -62,23 +62,17 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Remove legacy orphan tags (one-time registry cleanup)
+      - name: Prune untagged dev-build versions
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PKG: ${{ github.event.repository.name }}
-          ORPHANS: "main sha-1de34aa sha-2060095 sha-6a9b465 sha-7305c9a sha-a1685c7 sha-b905326 sha-c686b0b sha-c690854 sha-fc65eb7"
-          PROTECTED: "1.2.0 1.2 latest"
         run: |
-          # Orphans left by the pre-1.1 publishing setup (branch-name 'main'
-          # tag + old dev 'sha-*' tags). The current main's sha- tag is NOT
-          # in ORPHANS and is kept on purpose.
-          #
-          # GHCR's registry API has no DELETE (HTTP 405), so the script uses
-          # the GitHub packages REST API. It never deletes a version shared
-          # by PROTECTED tags (1.2.0 / 1.2 / latest), because GitHub
-          # deletes the digest and every tag pointing at it.
-          #
-          # Idempotent - after the first successful run, remove this step
-          # and the ORPHANS list. See scripts/registry-cleanup.py.
+          # On every semver release, delete package versions that no tag
+          # points at (accidental pushes, aborted builds, old dev images).
+          # The script is fully registry-derived: it protects every semver
+          # tag (1.0, 1.2.0, ...) plus latest and never deletes a version
+          # shared by any of them, because GitHub deletes the digest and
+          # every tag pointing at it. Idempotent - safe to keep running.
+          # See scripts/registry-cleanup.py.
           python3 scripts/registry-cleanup.py

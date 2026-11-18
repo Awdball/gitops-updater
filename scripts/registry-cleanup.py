@@ -13,17 +13,19 @@ Strategy (digest-driven, registry-derived):
 Env:
   GH_TOKEN    GitHub API token with packages:write
   PKG         package name (e.g. "ascender-monitor")
-  PROTECTED   space-separated tag names to protect (default: release tags)
+  PROTECTED   optional: space-separated tag names to protect. When unset,
+              every semver tag (1.0, 1.2.0, ...) and `latest` in the
+              registry is protected automatically.
 """
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 
 TOKEN = os.environ["GH_TOKEN"]
 PKG = os.environ["PKG"]
-PROTECTED = set(os.environ.get("PROTECTED", "1.0 1.0.0 1.1 1.1.0 1.2 1.2.0 latest").split())
 API = "https://api.github.com".rstrip("/")
 REGISTRY = "https://ghcr.io"
 
@@ -98,6 +100,13 @@ tags = reg_list()
 print(f"tags: {len(tags)}")
 
 # --- Step 3: protected digest set ---
+# PROTECTED env (explicit) takes precedence; by default every semver tag
+# (1.0, 1.2.0, ...) and `latest` present in the registry is protected.
+PROTECTED = set(os.environ.get("PROTECTED", "").split()) or {
+    t for t in tags if t == "latest" or re.fullmatch(r"\d+(\.\d+)+", t)
+}
+if os.environ.get("PROTECTED"):
+    print(f"PROTECTED (explicit): {sorted(PROTECTED)}")
 protected_digests = set()
 for t in sorted(PROTECTED):
     d = reg_digest(t)
