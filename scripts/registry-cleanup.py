@@ -1,110 +1,154 @@
 #!/usr/bin/env python3
-"""Remove legacy orphan tags from this repository's GHCR package.
+"""Delete orphan package versions from a user's GHCR package.
 
-Background
-----------
-The pre-1.1 publishing setup pushed a branch-name ``main`` tag and per-push
-``sha-*`` dev tags to GHCR on every build of ``main``. Those tags are
-development debris: they have no version identity and make the registry page
-look unprofessional.
+Strategy (digest-driven, registry-derived):
+  1. Query GitHub packages API for all versions (id, name, created_at, manifests[]).
+  2. Fetch live tag -> digest mapping from the GHCR registry list endpoint.
+  3. Determine the PROTECTED digest set: any digest that a PROTECTED tag points at.
+  4. For each version:
+       - If ANY of its manifest digests is in the protected set -> SKIP (release).
+       - Otherwise it is pure orphan debris -> DELETE it.
+  5. Report what was deleted / skipped.
 
-GHCR's registry API has no DELETE method (``DELETE /v2/<repo>/manifests/<tag>``
-returns HTTP 405 even for owners), so orphan tags must be removed through the
-GitHub packages REST API, which requires an authenticated token (the CI job's
-GITHUB_TOKEN is sufficient with the declared ``packages: write`` permission).
-
-In the GitHub packages model a *version* is a unique manifest digest and
-deleting a version removes that digest together with every tag that points at
-it. For that reason this script never touches a version whose id or digest is
-shared with the protected release tags (``PROTECTED``) - doing so would wipe
-the current release out of the registry.
-
-Usage (CI)
-----------
-The script is driven entirely by environment variables:
-
-  GH_TOKEN   GitHub API token (CI: ``secrets.GITHUB_TOKEN``)
-  PKG        package name (CI: ``github.event.repository.name``)
-  ORPHANS    space-separated tag names to delete
-  PROTECTED  space-separated tag names whose versions must survive
-  API_BASE   optional override of the GitHub API base (for local testing)
-
-Exit status: 0 when all present orphans were deleted (or were absent),
-1 when any deletion was rejected by the API.
+Env:
+  GH_TOKEN    GitHub API token with packages:write
+  PKG         package name (e.g. "ascender-monitor")
+  PROTECTED   space-separated tag names to protect (default: release tags)
 """
-
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
 
+TOKEN = os.environ["GH_TOKEN"]
+PKG = os.environ["PKG"]
+PROTECTED = set(os.environ.get("PROTECTED", "1.0 1.0.0 1.1 1.1.0 1.2 1.2.0 latest").split())
+API = "https://api.github.com".rstrip("/")
+REGISTRY = "https://ghcr.io"
 
-def main() -> int:
-    token = os.environ["GH_TOKEN"]
-    pkg = os.environ["PKG"]
-    orphans = os.environ.get("ORPHANS", "").split()
-    protected = set(os.environ.get("PROTECTED", "").split())
-    api_base = os.environ.get("API_BASE", "https://api.github.com").rstrip("/")
 
-    def call(method: str, url: str):
-        req = urllib.request.Request(
-            url,
-            method=method,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
+def reg_bearer(pkg: str):
+    import base64
+    req = urllib.request.Request(
+        f"{REGISTRY}/token?service=ghcr.io&scope=repository:awdball/{pkg}:pull",
+        headers={"Authorization": "Basic " + base64.b64encode(f"awdball:{TOKEN}".encode()).decode()},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())["token"]
+
+
+def gh(method: str, path: str):
+    req = urllib.request.Request(
+        f"{API}{path}",
+        method=method,
+        headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return resp.status, resp.read()
+
+
+# --- Step 1: versions from packages API ---
+status, data = gh("GET", f"/user/packages/container/{PKG}/versions?per_page=100")
+versions = json.loads(data)
+print(f"versions: {len(versions)}")
+
+# Build: digest -> set of version_ids (a version may have multiple manifests/digests)
+digest_to_vids = {}
+vid_info = {}
+for v in versions:
+    vid = v["id"]
+    name = v.get("name", "")
+    created = v.get("created_at", "")[:10]
+    digests = [m.get("digest", "") for m in (v.get("manifests") or []) if m.get("digest")]
+    vid_info[vid] = {"name": name, "created": created, "digests": digests}
+    for d in digests:
+        digest_to_vids.setdefault(d, set()).add(vid)
+    # Also index by the version's own primary digest (name is often a digest)
+    if name.startswith("sha256:"):
+        digest_to_vids.setdefault(name, set()).add(vid)
+
+# --- Step 2: live tag -> digest from registry ---
+_BEARER_CACHE = {}
+
+def _bearer():
+    if PKG not in _BEARER_CACHE:
+        _BEARER_CACHE[PKG] = reg_bearer(PKG)
+    return _BEARER_CACHE[PKG]
+
+def reg_list():
+    req = urllib.request.Request(f"{REGISTRY}/v2/awdball/{PKG}/tags/list?n=200",
+                                 headers={"Authorization": f"Bearer {_bearer()}"})
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read()).get("tags", [])
+
+def reg_digest(tag):
+    """Return the index digest for a tag from the registry."""
+    req = urllib.request.Request(f"{REGISTRY}/v2/awdball/{PKG}/manifests/{tag}", headers={
+        "Authorization": f"Bearer {_bearer()}",
+        "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+    })
+    try:
         with urllib.request.urlopen(req) as resp:
-            return resp.status, resp.read()
+            return resp.headers.get("Docker-Content-Digest", "")
+    except Exception:
+        return ""
 
-    status, data = call("GET", f"{api_base}/user/packages/container/{pkg}/versions?per_page=100")
-    versions = json.loads(data)
+tags = reg_list()
+print(f"tags: {len(tags)}")
 
-    protected_ids = set()
-    protected_digests = set()
-    for version in versions:
-        if version.get("name") in protected:
-            protected_ids.add(version["id"])
-            for manifest in version.get("manifests") or []:
-                if manifest.get("digest"):
-                    protected_digests.add(manifest["digest"])
+# --- Step 3: protected digest set ---
+protected_digests = set()
+for t in sorted(PROTECTED):
+    d = reg_digest(t)
+    if d:
+        protected_digests.add(d)
+        print(f"  PROTECTED {t:<10} digest={d[:20]}...")
+    else:
+        print(f"  PROTECTED {t:<10} (no digest found)")
 
-    failed = []
-    for tag in orphans:
-        version = next((v for v in versions if v.get("name") == tag), None)
-        if version is None:
-            print(f"  {tag}: absent (already clean)")
-            continue
-        digests = [m.get("digest") for m in version.get("manifests") or []]
-        if version["id"] in protected_ids or any(d in protected_digests for d in digests):
-            print(f"  {tag}: SKIPPED - shares its manifest with a protected release tag")
-            continue
-        url = f"{api_base}/user/packages/container/{pkg}/versions/{version['id']}"
-        try:
-            status, body = call("DELETE", url)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                print(f"  {tag}: already removed")
-                continue
-            detail = exc.read()[:200].decode(errors="replace")
-            print(f"  {tag}: FAILED HTTP {exc.code}: {detail}", file=sys.stderr)
-            failed.append(tag)
-            continue
-        if status in (200, 202):
-            print(f"  {tag}: deleted (HTTP {status})")
+# --- Step 4: classify each version ---
+to_delete = []
+to_keep = []
+for vid, info in sorted(vid_info.items(), key=lambda x: x[1]["created"], reverse=True):
+    name = info["name"]
+    digests = set(info["digests"])
+    # Also check the version's name-as-digest
+    if name.startswith("sha256:"):
+        digests.add(name)
+    if digests & protected_digests:
+        to_keep.append((vid, info))
+    else:
+        to_delete.append((vid, info))
+
+print(f"\n=== DELETE ({len(to_delete)}) ===")
+for vid, info in to_delete:
+    print(f"  {vid}  {info['created']}  name={info['name'][:24]}  digests={[d[:16] for d in info['digests']]}")
+print(f"\n=== KEEP  ({len(to_keep)}) ===")
+for vid, info in to_keep:
+    print(f"  {vid}  {info['created']}  name={info['name'][:24]}  digests={[d[:16] for d in info['digests']]}")
+
+if "--dry-run" in sys.argv:
+    print("\ndry-run complete")
+    sys.exit(0)
+
+# --- Step 5: execute deletions ---
+failed = []
+for vid, info in to_delete:
+    try:
+        status, body = gh("DELETE", f"/user/packages/container/{PKG}/versions/{vid}")
+        if status in (200, 202, 204):
+            print(f"  DELETED {vid} ({info['name'][:30]})")
         else:
-            detail = body[:200].decode(errors="replace")
-            print(f"  {tag}: FAILED HTTP {status}: {detail}", file=sys.stderr)
-            failed.append(tag)
+            print(f"  FAILED  {vid} HTTP {status}: {body[:200].decode(errors='replace')}")
+            failed.append(vid)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            print(f"  ALREADY GONE {vid}")
+        else:
+            detail = exc.read()[:200].decode(errors="replace")
+            print(f"  FAILED  {vid} HTTP {exc.code}: {detail}")
+            failed.append(vid)
 
-    if failed:
-        print(f"registry cleanup FAILED for: {', '.join(failed)}", file=sys.stderr)
-        return 1
-    print("registry cleanup complete")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+print(f"\n{'CLEANUP OK' if not failed else f'CLEANUP FAILED: {failed}'}")
+sys.exit(1 if failed else 0)
