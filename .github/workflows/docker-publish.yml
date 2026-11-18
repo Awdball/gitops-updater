@@ -39,11 +39,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Publishing policy: semver releases carry 1.2.0 / 1.2 / latest.
+          # Main-branch builds only ever mint a dev sha-<commit> tag —
+          # never a branch-name tag, and never `latest`.
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern=latest
             type=sha
 
       - name: Build and push Docker image
@@ -56,4 +58,22 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          attestations: false
+          provenance: false
+          sbom: false
 
+      - name: Remove legacy orphan tags (one-time registry cleanup)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Orphans left behind by the pre-1.1 publishing setup: the
+          # branch-name 'main' tag and old dev 'sha-*' tags. Deletion is
+          # idempotent — an already-deleted tag returns 404 and the loop
+          # carries on. Remove this step after the first v1.2.0 release.
+          for tag in main sha-7305c9a sha-b905326 sha-c686b0b sha-c690854 sha-6a9b465 sha-fc65eb7 sha-a1685c7 sha-2060095 sha-1de34aa; do
+            curl -fsS -X DELETE \
+              -H "Authorization: Bearer $GHCR_TOKEN" \
+              "https://ghcr.io/v2/awdball/gitops-updater/manifests/${tag}" \
+              >/dev/null && echo "  deleted: ${tag}" || echo "  skipped (absent?): ${tag}"
+          done

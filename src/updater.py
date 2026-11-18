@@ -593,6 +593,17 @@ class GitOpsEngine:
                 if current.version is None or latest.version is None:
                     continue
 
+                # Only ever compare real semver versions. A non-semver version
+                # (e.g. a branch build carrying an OCI version label of "main")
+                # has nothing meaningful to compare against and must not
+                # surface as an "update" — skip the workload for this scan.
+                if parse_semver(current.version) is None or parse_semver(latest.version) is None:
+                    logger.warning(
+                        "Skipping %s: non-semver version encountered (%s -> %s)",
+                        item.workload, current.version, latest.version,
+                    )
+                    continue
+
                 current_version = current.version
                 latest_version = latest.version
                 same_version = current_version == latest_version
