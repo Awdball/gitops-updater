@@ -63,7 +63,7 @@ for v in versions:
     name = v.get("name", "")
     created = v.get("created_at", "")[:10]
     digests = [m.get("digest", "") for m in (v.get("manifests") or []) if m.get("digest")]
-    vid_info[vid] = {"name": name, "created": created, "digests": digests}
+    vid_info[vid] = {"name": name, "created": created, "created_at": v.get("created_at", ""), "digests": digests}
     for d in digests:
         digest_to_vids.setdefault(d, set()).add(vid)
     # Also index by the version's own primary digest (name is often a digest)
@@ -116,6 +116,44 @@ for t in sorted(PROTECTED):
     else:
         print(f"  PROTECTED {t:<10} (no digest found)")
 
+# --- Step 3b: protect the platform children of every protected multi-arch index.
+# The child (per-arch) manifests are untagged and each has its own version id;
+# without this, deleting "untagged" versions orphans the index it belongs to.
+from urllib.error import HTTPError
+
+def reg_manifest_ref(tag):
+    req = urllib.request.Request(
+        f"{REGISTRY}/v2/awdball/{PKG}/manifests/{tag}",
+        headers={
+            "Authorization": f"Bearer {_bearer()}",
+            "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+children_of = []
+for t in sorted(PROTECTED):
+    ref = reg_manifest_ref(t)
+    if ref and "manifests" in ref:  # multi-arch index
+        for m in ref["manifests"]:
+            if m.get("digest"):
+                protected_digests.add(m["digest"])
+                children_of.append((t, m["digest"][:20]))
+if children_of:
+    for t, d in children_of:
+        print(f"  PROTECTED-CHILD of {t:<8} digest={d}...")
+
+# --- Step 3c: AGE GUARD.
+# Never touch manifests created within the last 6 hours: a live CI push may not
+# yet be visible as "tagged" in the API (eventual consistency), and GitHub's
+# GC is asynchronous after deletes. Orphan dev junk is always much older.
+from datetime import datetime, timedelta, timezone
+AGC_CUTOFF = datetime.now(timezone.utc) - timedelta(hours=6)
+
 # --- Step 4: classify each version ---
 to_delete = []
 to_keep = []
@@ -127,8 +165,17 @@ for vid, info in sorted(vid_info.items(), key=lambda x: x[1]["created"], reverse
         digests.add(name)
     if digests & protected_digests:
         to_keep.append((vid, info))
-    else:
-        to_delete.append((vid, info))
+        continue
+    # Age guard: skip anything created within the last 6 hours (in-flight CI).
+    try:
+        created_dt = datetime.fromisoformat(info["created_at"].replace("Z", "+00:00"))
+        if created_dt > AGC_CUTOFF:
+            print(f"  AGE-GUARD skip {vid} (created {info['created_at']}, name={name[:24]})")
+            to_keep.append((vid, info))
+            continue
+    except Exception:
+        pass
+    to_delete.append((vid, info))
 
 print(f"\n=== DELETE ({len(to_delete)}) ===")
 for vid, info in to_delete:
