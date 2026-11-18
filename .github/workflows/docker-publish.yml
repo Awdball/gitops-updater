@@ -39,13 +39,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # Publishing policy: semver releases carry 1.2.0 / 1.2 / latest.
-          # Main-branch builds only ever mint a dev sha-<commit> tag —
-          # never a branch-name tag, and never `latest`.
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern=latest
             type=sha
 
       - name: Build and push Docker image
@@ -61,18 +58,3 @@ jobs:
           attestations: false
           provenance: false
           sbom: false
-
-      - name: Prune untagged dev-build versions
-        if: false
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PKG: ${{ github.event.repository.name }}
-        run: |
-          # On every semver release, delete package versions that no tag
-          # points at (accidental pushes, aborted builds, old dev images).
-          # The script is fully registry-derived: it protects every semver
-          # tag (1.0, 1.2.0, ...) plus latest and never deletes a version
-          # shared by any of them, because GitHub deletes the digest and
-          # every tag pointing at it. Idempotent - safe to keep running.
-          # See scripts/registry-cleanup.py.
-          python3 scripts/registry-cleanup.py
